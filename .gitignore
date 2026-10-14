@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# środowisko wirtualne (pip install pyside6)
+.venv/
+
+# bazy zakładek, gdyby trafiły do katalogu projektu
+*.db
+*.db-journal
+*.db.old
+*.sync-conflict-*
