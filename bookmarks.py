@@ -26,14 +26,17 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 from PySide6.QtCore import (
-    QAbstractTableModel, QFileSystemWatcher, QModelIndex, QObject, Qt, QTimer, QUrl, Signal,
+    QAbstractTableModel, QFileSystemWatcher, QLibraryInfo, QModelIndex, QObject, Qt, QTimer, QUrl,
+    Signal,
 )
-from PySide6.QtGui import QAction, QClipboard, QDesktopServices, QGuiApplication, QKeySequence
+from PySide6.QtGui import (
+    QAction, QClipboard, QColor, QDesktopServices, QGuiApplication, QKeySequence, QPalette,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCompleter, QDialog, QDialogButtonBox,
     QFileDialog, QFormLayout, QHeaderView, QInputDialog, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QSplitter,
-    QTableView, QVBoxLayout, QWidget,
+    QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QSplitter, QStyle,
+    QStyledItemDelegate, QStyleOptionViewItem, QTableView, QVBoxLayout, QWidget,
 )
 
 DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "bookmark-search"
@@ -59,6 +62,36 @@ def fts_query(text: str) -> str:
     # każde słowo jako prefiks, wszystkie muszą wystąpić (AND)
     words = re.findall(r"\w+", fold(text), re.UNICODE)
     return " ".join(f'"{w}"*' for w in words)
+
+
+def search_terms(text: str) -> list[str]:
+    # jak tokenizer FTS: podkreślnik też rozdziela słowa
+    return re.findall(r"[^\W_]+", fold(text))
+
+
+def match_spans(text: str, terms: list[str]) -> list[tuple[int, int]]:
+    """Fragmenty text (start, koniec), które pasują do słów wyszukiwania –
+    tak jak w FTS: początek słowa, bez wielkości liter i ogonków."""
+    if not text or not terms:
+        return []
+    # fold() może zmienić długość ('ß' -> 'ss'), więc pamiętamy, z którego znaku co powstało
+    folded, owner = [], []
+    for i, c in enumerate(text):
+        f = fold(c)
+        folded.append(f)
+        owner += [i] * len(f)
+    folded = "".join(folded)
+    spans = []
+    for t in terms:
+        for m in re.finditer(r"(?<![^\W_])" + re.escape(t), folded):
+            spans.append((owner[m.start()], owner[m.end() - 1] + 1))
+    merged = []
+    for a, b in sorted(spans):
+        if merged and a <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+        else:
+            merged.append((a, b))
+    return merged
 
 
 def parse_tags(text) -> list[str]:
@@ -442,30 +475,40 @@ class TitleFetcher(QObject):
 
 
 class TagsEdit(QLineEdit):
-    """Pole tagów rozdzielanych przecinkami z podpowiedziami dla ostatniego tagu."""
+    """Pole tagów rozdzielanych przecinkami z podpowiedziami dla ostatniego tagu.
+    Pusta pozycja (klik, strzałka w dół, po przecinku) pokazuje wszystkie tagi."""
 
     def __init__(self, all_tags):
         super().__init__()
-        self.comp = QCompleter(all_tags, self)
+        self.all_tags = list(all_tags)
+        self.comp = QCompleter(self.all_tags, self)
         self.comp.setCaseSensitivity(Qt.CaseInsensitive)
         self.comp.setFilterMode(Qt.MatchContains)
+        self.comp.setMaxVisibleItems(15)
         self.comp.setWidget(self)
         self.comp.activated.connect(self.insert_tag)
-        self.textEdited.connect(self.update_prefix)
+        self.textEdited.connect(lambda: self.update_prefix(show_all=self.text().rstrip().endswith(",")))
 
     def current_word(self):
         return self.text()[:self.cursorPosition()].split(",")[-1].strip()
 
-    def update_prefix(self):
+    def update_prefix(self, show_all=False):
         word = self.current_word()
-        if not word:
+        if not word and not show_all:
             self.comp.popup().hide()
             return
+        # bez tagów, które już są wpisane
+        used = set(parse_tags(self.text())) - {word.lower()}
+        self.comp.model().setStringList([t for t in self.all_tags if t not in used])
         self.comp.setCompletionPrefix(word)
         if self.comp.completionCount():
             self.comp.complete()
         else:
             self.comp.popup().hide()
+
+    def mousePressEvent(self, e):
+        super().mousePressEvent(e)
+        self.update_prefix(show_all=True)
 
     def insert_tag(self, tag):
         before = self.text()[:self.cursorPosition()].rsplit(",", 1)
@@ -476,6 +519,9 @@ class TagsEdit(QLineEdit):
         # gdy podpowiedzi są otwarte, Enter/Tab wybiera tag zamiast zapisywać
         if self.comp.popup().isVisible() and e.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Tab):
             e.ignore()
+            return
+        if e.key() == Qt.Key_Down and not self.comp.popup().isVisible():
+            self.update_prefix(show_all=True)
             return
         super().keyPressEvent(e)
 
@@ -603,6 +649,64 @@ class ResultsModel(QAbstractTableModel):
         return self.rows[row][2]
 
 
+class TagList(QListWidget):
+    """Klik wybiera jeden tag (drugi klik go odznacza), Ctrl+klik dokłada kolejny."""
+
+    def __init__(self):
+        super().__init__()
+        self.setSelectionMode(QAbstractItemView.ExtendedSelection)
+
+    def mousePressEvent(self, e):
+        item = self.itemAt(e.position().toPoint())
+        if (item and e.button() == Qt.LeftButton and not e.modifiers()
+                and self.selectedItems() == [item]):
+            self.clearSelection()
+            return
+        super().mousePressEvent(e)
+
+
+class HighlightDelegate(QStyledItemDelegate):
+    """Podświetla w komórce litery pasujące do wpisanego filtra."""
+
+    COLOR = QColor(255, 200, 0, 120)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.terms = []
+
+    def paint(self, painter, option, index):
+        text = index.data(Qt.DisplayRole) or ""
+        spans = match_spans(text, self.terms)
+        if not spans:
+            return super().paint(painter, option, index)
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        opt.text = ""
+        widget = opt.widget
+        style = widget.style() if widget else QApplication.style()
+        style.drawControl(QStyle.CE_ItemViewItem, opt, painter, widget)
+
+        margin = style.pixelMetric(QStyle.PM_FocusFrameHMargin, None, widget) + 1
+        rect = style.subElementRect(QStyle.SE_ItemViewItemText, opt, widget).adjusted(margin, 0, -margin, 0)
+        fm = opt.fontMetrics
+        shown = fm.elidedText(text, Qt.ElideRight, rect.width())
+        visible = len(shown) if shown == text else len(shown) - 1  # bez "…"
+
+        painter.save()
+        painter.setClipRect(rect)
+        for a, b in spans:
+            b = min(b, visible)
+            if a >= b:
+                continue
+            x = rect.left() + fm.horizontalAdvance(shown[:a])
+            painter.fillRect(x, rect.top() + 1, fm.horizontalAdvance(shown[a:b]), rect.height() - 2, self.COLOR)
+        selected = opt.state & QStyle.State_Selected
+        painter.setPen(opt.palette.color(QPalette.HighlightedText if selected else QPalette.Text))
+        painter.setFont(opt.font)
+        painter.drawText(rect, Qt.AlignLeft | Qt.AlignVCenter, shown)
+        painter.restore()
+
+
 class MainWindow(QMainWindow):
     def __init__(self, store: Store):
         super().__init__()
@@ -620,10 +724,9 @@ class MainWindow(QMainWindow):
         self.timer = QTimer(singleShot=True, interval=120)
         self.timer.timeout.connect(self.refresh)
 
-        self.tag_list = QListWidget()
-        self.tag_list.setSelectionMode(QAbstractItemView.MultiSelection)
+        self.tag_list = TagList()
         self.tag_list.itemSelectionChanged.connect(self.refresh)
-        tag_label = QLabel("Tagi (kliknij, żeby filtrować)")
+        tag_label = QLabel("Tagi (klik – filtruj, Ctrl+klik – kilka)")
         tag_box = QWidget()
         tl = QVBoxLayout(tag_box)
         tl.setContentsMargins(0, 0, 0, 0)
@@ -633,6 +736,9 @@ class MainWindow(QMainWindow):
         self.model = ResultsModel()
         self.table = QTableView()
         self.table.setModel(self.model)
+        self.highlighter = HighlightDelegate(self.table)
+        for col in (0, 1, 2):
+            self.table.setItemDelegateForColumn(col, self.highlighter)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.verticalHeader().hide()
@@ -746,6 +852,7 @@ class MainWindow(QMainWindow):
 
     def refresh(self):
         rows = self.store.search(self.search.text(), self.selected_tags())
+        self.highlighter.terms = search_terms(self.search.text())
         self.model.set_rows(rows)
         if rows:
             self.table.selectRow(0)
@@ -860,12 +967,22 @@ def notify(title, body):
         subprocess.Popen(["notify-send", title, body])
 
 
+def use_available_platform_theme():
+    # PySide6 z pip ma własne Qt bez systemowych pluginów (np. qt6ct) – bez
+    # motywu Qt nie widzi ciemnego schematu, więc bierzemy go z portalu XDG.
+    themes = Path(QLibraryInfo.path(QLibraryInfo.LibraryPath.PluginsPath)) / "platformthemes"
+    wanted = os.environ.get("QT_QPA_PLATFORMTHEME", "")
+    if not wanted or not list(themes.glob(f"*{wanted}*")):
+        os.environ["QT_QPA_PLATFORMTHEME"] = "xdgdesktopportal"
+
+
 def main():
     ap = argparse.ArgumentParser(description="Zakładki z tagami")
     ap.add_argument("--add", nargs="?", const="", metavar="URL",
                     help="dodaj zakładkę (bez URL – adres ze schowka)")
     args = ap.parse_args()
 
+    use_available_platform_theme()
     app = QApplication(sys.argv[:1])
     app.setApplicationName("zakladki")
     app.setDesktopFileName("zakladki")
