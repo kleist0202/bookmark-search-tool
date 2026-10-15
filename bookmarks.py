@@ -26,11 +26,12 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 from PySide6.QtCore import (
-    QAbstractTableModel, QFileSystemWatcher, QLibraryInfo, QModelIndex, QObject, Qt, QTimer, QUrl,
-    Signal,
+    QAbstractTableModel, QFileSystemWatcher, QLibraryInfo, QModelIndex, QObject, QRectF, Qt, QTimer,
+    QUrl, Signal,
 )
 from PySide6.QtGui import (
-    QAction, QClipboard, QColor, QDesktopServices, QGuiApplication, QKeySequence, QPalette,
+    QAction, QClipboard, QColor, QDesktopServices, QGuiApplication, QKeySequence, QPainter,
+    QPalette,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCompleter, QDialog, QDialogButtonBox,
@@ -43,6 +44,10 @@ DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) /
 CONFIG_FILE = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "zakladki/config"
 CONFLICTS_DIR = DATA_DIR / "scalone-konflikty"
 RESULT_LIMIT = 5000
+# główne foldery przeglądarek – nie robimy z nich tagów
+ROOT_FOLDERS = {"bookmarks menu", "bookmarks toolbar", "other bookmarks", "bookmarks bar",
+                "all bookmarks", "mobile bookmarks", "menu zakładek", "pasek zakładek",
+                "inne zakładki", "wszystkie zakładki", "zakładki na telefonie"}
 
 
 # ----------------------------------------------------------------------- tekst
@@ -268,7 +273,8 @@ class Store:
                                            int(it.get("added") or time.time()))).lastrowid
                     added += 1
                 self.db.executemany("INSERT OR IGNORE INTO tags(bookmark_id, tag) VALUES (?, ?)",
-                                    [(bid, t) for t in parse_tags(it.get("tags", []))])
+                                    [(bid, t) for t in parse_tags(it.get("tags", []))
+                                     if t not in ROOT_FOLDERS])
                 self._reindex(bid)
         return added
 
@@ -379,9 +385,6 @@ def read_firefox(places: Path):
 class NetscapeParser(HTMLParser):
     """Format eksportu HTML zakładek (Firefox, Chrome, ...). Foldery -> tagi."""
 
-    ROOT_NAMES = {"bookmarks menu", "bookmarks toolbar", "other bookmarks", "bookmarks bar",
-                  "menu zakładek", "pasek zakładek", "inne zakładki"}
-
     def __init__(self):
         super().__init__()
         self.items, self.stack = [], []
@@ -398,7 +401,7 @@ class NetscapeParser(HTMLParser):
             self.pending_folder = None
         elif tag == "a" and a.get("href"):
             folders = [f.strip() for f in self.stack
-                       if f.strip() and f.strip().lower() not in self.ROOT_NAMES]
+                       if f.strip() and f.strip().lower() not in ROOT_FOLDERS]
             self.current = {"url": a["href"], "title": "",
                             "tags": (a.get("tags") or "").split(",") + folders,
                             "added": int(a.get("add_date") or 0)}
@@ -650,16 +653,32 @@ class ResultsModel(QAbstractTableModel):
 
 
 class TagList(QListWidget):
-    """Klik wybiera jeden tag (drugi klik go odznacza), Ctrl+klik dokłada kolejny."""
+    """Klik wybiera jeden tag (drugi klik go odznacza), Ctrl+klik dokłada kolejny.
+    Pierwsza pozycja, "Wszystkie", jest zaznaczona, gdy nie filtrujemy po tagach."""
 
     def __init__(self):
         super().__init__()
         self.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.itemSelectionChanged.connect(self.keep_all_item)
+
+    def all_item(self):
+        return self.item(0)
+
+    def selected_tags(self):
+        return [i.data(Qt.UserRole) for i in self.selectedItems() if i is not self.all_item()]
+
+    def keep_all_item(self):
+        all_item = self.all_item()
+        if all_item is None:
+            return
+        self.blockSignals(True)
+        all_item.setSelected(not self.selected_tags())
+        self.blockSignals(False)
 
     def mousePressEvent(self, e):
         item = self.itemAt(e.position().toPoint())
-        if (item and e.button() == Qt.LeftButton and not e.modifiers()
-                and self.selectedItems() == [item]):
+        if item and e.button() == Qt.LeftButton and (
+                item is self.all_item() or not e.modifiers() and self.selectedItems() == [item]):
             self.clearSelection()
             return
         super().mousePressEvent(e)
@@ -694,12 +713,16 @@ class HighlightDelegate(QStyledItemDelegate):
 
         painter.save()
         painter.setClipRect(rect)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(self.COLOR)
+        top = rect.top() + (rect.height() - fm.height()) / 2
         for a, b in spans:
             b = min(b, visible)
             if a >= b:
                 continue
             x = rect.left() + fm.horizontalAdvance(shown[:a])
-            painter.fillRect(x, rect.top() + 1, fm.horizontalAdvance(shown[a:b]), rect.height() - 2, self.COLOR)
+            painter.drawRoundedRect(QRectF(x - 1, top, fm.horizontalAdvance(shown[a:b]) + 2, fm.height()), 3, 3)
         selected = opt.state & QStyle.State_Selected
         painter.setPen(opt.palette.color(QPalette.HighlightedText if selected else QPalette.Text))
         painter.setFont(opt.font)
@@ -716,6 +739,7 @@ class MainWindow(QMainWindow):
 
         self.search = QLineEdit(placeholderText="Szukaj w tytułach, adresach i tagach…   "
                                                 "(Enter – otwórz, Ctrl+N – dodaj, Esc – zamknij)")
+        self.search.setObjectName("search")
         self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(lambda: self.timer.start())
         self.search.returnPressed.connect(self.open_first)
@@ -727,9 +751,11 @@ class MainWindow(QMainWindow):
         self.tag_list = TagList()
         self.tag_list.itemSelectionChanged.connect(self.refresh)
         tag_label = QLabel("Tagi (klik – filtruj, Ctrl+klik – kilka)")
+        tag_label.setObjectName("sideLabel")
         tag_box = QWidget()
         tl = QVBoxLayout(tag_box)
         tl.setContentsMargins(0, 0, 0, 0)
+        tl.setSpacing(6)
         tl.addWidget(tag_label)
         tl.addWidget(self.tag_list)
 
@@ -744,6 +770,11 @@ class MainWindow(QMainWindow):
         self.table.verticalHeader().hide()
         self.table.setWordWrap(False)
         self.table.setAlternatingRowColors(True)
+        self.table.setShowGrid(False)
+        self.table.setFrameShape(QTableView.NoFrame)
+        self.table.verticalHeader().setDefaultSectionSize(self.table.fontMetrics().height() + 14)
+        self.table.horizontalHeader().setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.table.horizontalHeader().setHighlightSections(False)
         header = self.table.horizontalHeader()
         # tytuł i adres dzielą wolne miejsce, tagi i data mają stałą szerokość
         header.setSectionResizeMode(0, QHeaderView.Stretch)
@@ -769,11 +800,14 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([200, 1000])
+        splitter.setHandleWidth(10)
         tag_label.setWordWrap(True)
         tag_box.setMinimumWidth(90)
 
         central = QWidget()
         lay = QVBoxLayout(central)
+        lay.setContentsMargins(12, 12, 12, 6)
+        lay.setSpacing(10)
         lay.addWidget(self.search)
         lay.addWidget(splitter)
         self.setCentralWidget(central)
@@ -841,14 +875,14 @@ class MainWindow(QMainWindow):
     def escape(self):
         if self.search.text():
             self.search.clear()
-        elif self.tag_list.selectedItems():
+        elif self.selected_tags():
             self.tag_list.clearSelection()
         else:
             self.close()
 
     # -- dane
     def selected_tags(self):
-        return [i.data(Qt.UserRole) for i in self.tag_list.selectedItems()]
+        return self.tag_list.selected_tags()
 
     def refresh(self):
         rows = self.store.search(self.search.text(), self.selected_tags())
@@ -864,11 +898,17 @@ class MainWindow(QMainWindow):
         selected = set(self.selected_tags())
         self.tag_list.blockSignals(True)
         self.tag_list.clear()
+        all_item = QListWidgetItem(f"Wszystkie  ({self.store.count()})")
+        font = all_item.font()
+        font.setBold(True)
+        all_item.setFont(font)
+        self.tag_list.addItem(all_item)
         for tag, n in self.store.all_tags():
             item = QListWidgetItem(f"{tag}  ({n})")
             item.setData(Qt.UserRole, tag)
             self.tag_list.addItem(item)
             item.setSelected(tag in selected)
+        self.tag_list.keep_all_item()
         self.tag_list.blockSignals(False)
 
     def reload(self):
@@ -967,6 +1007,67 @@ def notify(title, body):
         subprocess.Popen(["notify-send", title, body])
 
 
+STYLE = """
+QMainWindow, QDialog { background: palette(window); }
+QLineEdit {
+    border: 1px solid palette(mid); border-radius: 8px;
+    padding: 6px 10px; background: palette(base);
+    selection-background-color: palette(highlight);
+}
+QLineEdit:focus { border: 2px solid palette(highlight); padding: 5px 9px; }
+QLineEdit#search { font-size: 12pt; padding: 9px 14px; border-radius: 10px; }
+QLineEdit#search:focus { padding: 8px 13px; }
+QTableView, QListWidget {
+    border: 1px solid palette(midlight); border-radius: 8px;
+    background: palette(base); outline: 0;
+}
+QTableView { gridline-color: transparent; }
+QListWidget { padding: 4px; }
+QListWidget::item { padding: 5px 8px; border-radius: 6px; margin: 1px 0; }
+QListWidget::item:hover { background: palette(alternate-base); }
+QListWidget::item:selected { background: palette(highlight); color: palette(highlighted-text); }
+QHeaderView { background: transparent; }
+QHeaderView::section {
+    background: palette(base); border: none; border-bottom: 1px solid palette(midlight);
+    padding: 6px 8px; font-weight: 600; color: palette(placeholder-text);
+}
+QLabel#sideLabel { color: palette(placeholder-text); font-weight: 600; padding: 2px 4px; }
+QSplitter::handle { background: transparent; }
+QStatusBar { color: palette(placeholder-text); }
+QStatusBar::item { border: none; }
+QScrollBar { background: transparent; border: none; }
+QScrollBar:vertical { width: 12px; margin: 2px; }
+QScrollBar:horizontal { height: 12px; margin: 2px; }
+QScrollBar::handle { background: SCROLL; border-radius: 4px; }
+QScrollBar::handle:hover, QScrollBar::handle:pressed { background: SCROLL_HOVER; }
+QScrollBar::handle:vertical { min-height: 30px; }
+QScrollBar::handle:horizontal { min-width: 30px; }
+QScrollBar::add-line, QScrollBar::sub-line { height: 0; width: 0; }
+QScrollBar::add-page, QScrollBar::sub-page { background: none; }
+QPushButton {
+    border: 1px solid palette(mid); border-radius: 8px; padding: 6px 16px;
+    background: palette(button);
+}
+QPushButton:hover { border-color: palette(highlight); }
+QPushButton:default { background: palette(highlight); color: palette(highlighted-text); border: none; }
+QMenu { padding: 4px; border: 1px solid palette(mid); border-radius: 8px; }
+QMenu::item { padding: 6px 24px 6px 12px; border-radius: 6px; }
+QMenu::item:selected { background: palette(highlight); color: palette(highlighted-text); }
+QMenu::separator { height: 1px; background: palette(midlight); margin: 4px 8px; }
+"""
+
+
+def apply_style(app):
+    # Fusion wygląda tak samo wszędzie, a kolory i tak bierze z systemu (jasny/ciemny)
+    palette = app.palette()
+    app.setStyle("Fusion")
+    app.setPalette(palette)
+    # uchwyt paska: kolor tekstu z przezroczystością – widać go na jasnym i ciemnym tle
+    text = palette.color(QPalette.Text)
+    rgba = lambda a: f"rgba({text.red()}, {text.green()}, {text.blue()}, {a})"
+    app.setStyleSheet(STYLE.replace("SCROLL_HOVER", rgba(150)).replace("SCROLL", rgba(90)))
+
+
 def use_available_platform_theme():
     # PySide6 z pip ma własne Qt bez systemowych pluginów (np. qt6ct) – bez
     # motywu Qt nie widzi ciemnego schematu, więc bierzemy go z portalu XDG.
@@ -986,6 +1087,7 @@ def main():
     app = QApplication(sys.argv[:1])
     app.setApplicationName("zakladki")
     app.setDesktopFileName("zakladki")
+    apply_style(app)
     store = Store(db_path())
 
     if args.add is not None:
